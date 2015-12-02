@@ -3,31 +3,17 @@ const stream = Npm.require('stream');
 const stripJsonComments = Npm.require('strip-json-comments');
 const npm = Npm.require('npm');
 const os = Npm.require('os');
-const camelCase = Npm.require('camelcase');
 const {fs, path} = Plugin;
 
 /**
  * Logs given messages to a file
  *
  * @methodName logMsg
- * @param {...Object} args - collection/map/whatever of arguments to be logged
+ * @param {...String} args - collection/map/whatever of arguments to be logged
  */
 function logMsg(...args) {
-    const str = `${Date.now()} => ${JSON.stringify(args, null, '\t')}\r\n`;
-    console.log(str); // if its available, debug it here
-    process.stdout.write(str); //not sure exactly where this goes,, to the console? so if above line needed?
-    /**
-     * When debugging compiler code, it can get pretty hairy. You don't always have access to the same error reporting
-     * functionality, and alot of the time STDOUT/console.log/etc are redirected to somwhere you can't see. I've also found
-     * that is quite a pain to use NodeInspector to debug package.js/other native js (ie: compiler plugins) this is a quick
-     * hack around this issue that allows you to (synchronously) write to an error log (Something meteor doesn't support
-     * out of the box. It may be ugly, slow to test, but it's quick to implement.for trivial matters. This func helped me when
-     * fixing #3 @see https://github.com/vazco/meteor-universe-modules-npm/issues/3 so I will keep it arround incase someone
-     * could benefit from it.
-     *
-     * TL;DR uncomment line directly below to log messages to a file.
-     */
-    //fs.appendFileSync('SOMEPATH-WHICH-REDACTED/fslog.txt', str, 'utf8');
+    console.log('=>', ...args, '\r\n');
+    Plugin.nudge && Plugin.nudge();
 }
 
 const getString = Meteor.wrapAsync((bundle, cb) => {
@@ -46,22 +32,11 @@ class UniverseModulesNPMBuilder extends CachingCompiler {
     }
 
     getCacheKey(file) {
-        return file.getSourceHash() + file.getPathInPackage() + JSON.stringify(file.getFileOptions());
+        return file.getSourceHash() + getProjectSourcePath(file) + JSON.stringify(file.getFileOptions());
     }
 
     compileResultSize(compileResult) {
         return compileResult.length * 2;
-    }
-
-    /**
-     * Gets the base directory for a given file based on file location
-     *
-     * @param {Object} file - handle for file that is to be compiled
-     * @returns {string} the full qualified path containing given  file
-     */
-    getBasedir(file) {
-        const basedir = path.resolve(Plugin.convertToStandardPath(os.tmpdir()), 'universe-npm');
-        return path.resolve(basedir, (file.getPackageName() || '' + file.getPathInPackage()).replace(/[^a-zA-Z0-9\-]/g, '_'));
     }
 
     addCompileResult(file, compileResult) {
@@ -103,22 +78,8 @@ class UniverseModulesNPMBuilder extends CachingCompiler {
         }
     }
 
-    /**
-     * Passes given configuration object's properties onto the module that's getting compiled.
-     *
-     * @param {object} sysConfig - a map object containing config info in the form of { ..., cfgName: cfgValue, ... }
-     * @returns {string} - code being generated (or not) for the System.config
-     */
-    configureSystem(sysConfig) {
-        if (typeof sysConfig === 'object' && Object.keys(sysConfig).length) {
-            return `System.config(${JSON.stringify(sysConfig)});`;
-        }
-        return '';
-    }
-
     compileOneFile(file) {
-        const sourcePath = file.getPackageName() + '/' + file.getPathInPackage();
-        Plugin.nudge && Plugin.nudge();
+        const sourcePath = getProjectSourcePath(file);
         logMsg('Universe NPM: ' + sourcePath);
         try {
             const {source, config, moduleId} = this.prepareSource(file);
@@ -131,10 +92,7 @@ class UniverseModulesNPMBuilder extends CachingCompiler {
             bundle.setEncoding('utf8');
             return this.getCompileResult(bundle, config.system, moduleId);
         } catch (_error) {
-            logMsg('error in compileOnFile ' + JSON.stringify({
-                message: _error.message,
-                sourcePath
-            }));
+            Plugin.nudge && Plugin.nudge();
             file.error({
                 message: _error.message,
                 sourcePath
@@ -144,17 +102,15 @@ class UniverseModulesNPMBuilder extends CachingCompiler {
 
     /**
      * Applies supplied browserify transforms to source files
-     * @param {mystery} browserify -  the browserify instance
+     * @param {*} browserify -  the browserify instance
      * @param {object} browserifyOptions - map in the format of { ..., transformName: { ...transformOptions... }, ... }
      */
     applyTransforms(browserify, browserifyOptions) {
-        //var envifyOptions, transformName, transformOptions, transforms;
-        //envifyOptions = browserifyOptions.transforms.envify; // and if there is no transforms set on browserifyOptions ---> kaboom
-        //delete browserifyOptions.transforms.envify;
-        //transforms = browserifyOptions.transforms;
-        _.forEach(browserifyOptions.transforms, (transformOptions, transformName) => {
-            browserify.transform(transformName, transformOptions);
-        });
+        if (browserifyOptions && browserifyOptions.transforms) {
+            _.forEach(browserifyOptions.transforms, (transformOptions, transformName) => {
+                browserify.transform(transformName, transformOptions);
+            });
+        }
     }
 
     getCompileResult(bundle, {dependencies, config, _bundleIndexes}, moduleId) {
@@ -164,7 +120,7 @@ class UniverseModulesNPMBuilder extends CachingCompiler {
         }
         // adding important system deps
         if (dependencies._deps) {
-            dependencies.concat(Object.keys(dependencies._deps)); // no need for ...spread here, looks akward infront of a wrapped expression
+            dependencies.push(...(Object.keys(dependencies._deps)));
         }
         const depPromisesStr = dependencies.map(dep =>
             `"${System.normalizeSync(dep)}"`
@@ -181,7 +137,7 @@ __UniverseNPMDynamicLoader("${moduleId}", [${depPromisesStr}], ${JSON.stringify(
     getBrowserifyOptions(file, userOptions) {
         userOptions = userOptions || {};
         const defaultOptions = {
-            basedir: Plugin.convertToOSPath(this.getBasedir(file)),
+            basedir: Plugin.convertToOSPath(getBasedir(file)),
             debug: true,
             ignoreMissing: true,
             transforms: {
@@ -201,20 +157,6 @@ __UniverseNPMDynamicLoader("${moduleId}", [${depPromisesStr}], ${JSON.stringify(
         return userOptions;
     }
 
-    getDebug() {
-        var debug, key, _i, _len, _ref1;
-        debug = true;
-        _ref1 = process.argv;
-        for (_i = 0, _len = _ref1.length; _i < _len; _i++) {
-            key = _ref1[_i];
-            if (key === 'bundle' || key === 'build') {
-                debug = __indexOf.call(process.argv, '--debug') >= 0;
-                break;
-            }
-        }
-        return debug;
-    }
-
     /**
      * Folds System.js wrapper around given file
      *
@@ -229,17 +171,14 @@ __UniverseNPMDynamicLoader("${moduleId}", [${depPromisesStr}], ${JSON.stringify(
         config.packages = config.packages || config.dependencies;
         if (config && config.packages) {
             _.each(config.packages, (version, packageName) => {
-                const camelCasePkgName = camelCase(packageName);
                 lines += (
-                    `    _uniSysModule.exports["${camelCasePkgName}"] = require('${packageName}');
-                    `
+                `    _uniSysModule.exports['${packageName}'] = require('${packageName}');` + '\n'
                 );
             });
             lines += (
-                `     _uniSysModule.exports._bundleRequire = require;
-                `
+                `    _uniSysModule.exports._bundleRequire = require;` + '\n'
             );
-            installPackages(this.getBasedir(file), file, config.packages);
+            installPackages(getBasedir(file), file, config.packages);
         }
         source.end(lines);
         return {source, config, moduleId};
@@ -276,6 +215,17 @@ __UniverseNPMDynamicLoader("${moduleId}", [${depPromisesStr}], ${JSON.stringify(
     }
 }
 
+/**
+ * Gets the base directory for a given file based on file location
+ *
+ * @param {Object} file - handle for file that is to be compiled
+ * @returns {string} the full qualified path containing given  file
+ */
+function getBasedir(file) {
+    const basedir = path.resolve(Plugin.convertToStandardPath(os.tmpdir()), 'universe-npm');
+    return path.resolve(basedir, getProjectSourcePath(file).replace(/[^a-zA-Z0-9\-]/g, '_'));
+}
+
 const ensureDepsInstalled = Meteor.wrapAsync((basedir, packages, cb) => {
     logMsg('Installing npm packages: ' + packages.join(', ') + '\r\n');
     npm.load((err) => {
@@ -287,7 +237,7 @@ const ensureDepsInstalled = Meteor.wrapAsync((basedir, packages, cb) => {
 
 function installPackages(basedir, file, packageList) {
     const packages = [];
-    var installedCount = 0;
+    let installedCount = 0;
     _.map(packageList, (version, packageName) => {
         if (typeof version === 'object') {
             version = version.version;
@@ -295,11 +245,7 @@ function installPackages(basedir, file, packageList) {
         if (!version) {
             file.error({
                 message: 'Missing version of npm package: ' + packageName,
-                sourcePath: file.getPackageName() + '/' + file.getPathInPackage()
-            });
-            logMsg({
-                message: 'Missing version of npm package: ' + packageName,
-                sourcePath: file.getPackageName() + '/' + file.getPathInPackage()
+                sourcePath: getProjectSourcePath(file)
             });
             return;
         }
@@ -326,13 +272,12 @@ function installPackages(basedir, file, packageList) {
     }
     try {
         deleteFolderRecursive(path.resolve(basedir, 'node_modules'));
-        savePackageJsnFile(file.getPackageName() + '/' + file.getPathInPackage(), basedir);
+        savePackageJsnFile(getProjectSourcePath(file), basedir);
         ensureDepsInstalled(basedir, packages);
     } catch (err) {
-        logMsg(...err);
         file.error({
             message: 'Couldn\'t install NPM package: ' + err.toString(),
-            sourcePath: (file.getPackageName() || '') + '/' + file.getPathInPackage()
+            sourcePath: getProjectSourcePath(file)
         });
     }
 }
@@ -367,6 +312,10 @@ function savePackageJsnFile(pgName, basedir) {
     } else {
         fs.writeFile(path.resolve(basedir, 'package.json'), data, 'utf8', () => {});
     }
+}
+
+function getProjectSourcePath(file) {
+    return (file.getPackageName() || '') + '/' + file.getPathInPackage();
 }
 
 Plugin.registerCompiler({
